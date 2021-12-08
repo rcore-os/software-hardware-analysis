@@ -8,6 +8,22 @@ sendme ：外设驱动 向 用户空间 发送信号 。
 
 backfire和sendme的代码一共有397行，不包括空行。
 
+
+## 思路
+准备一些配置参数，在主线程中初始化好线程需要的变量，根据线程数量启动线程数量个线程对,通过pthread_mutex_lock(),pthread_mutex_unlock()方式同步线程,并在前后使用gettimeofday测量释放和获取锁之间的延迟。主线程负责统计性能。
+## 原理
+
+使用两种 信号量 ， testmutex 和 syncmutex , testmutex 使用来测试延迟的，syncmutex是用来同步 ,接受发送的。并且 testmutex 全部上锁。
+
+每设置 一个 线程对，要开启两个线程 一个 sender 一个 receiver，
+
+在 一个 线程对里 ， sender 方 ，先对 syncmutex 上锁，然后 获取 当前时间，然后 在 testmutex 解锁。
+
+received 线程 ，上来 对 testmutex 上锁，因为 在线程开始前，testmutex 是锁着的所以等待，当sender方，释放锁后，获得执行，立刻统计当前时间，然后对 syncmutex，解锁。
+
+这样 统计 两个时间差，能计算出 信号量 使用 了 多少延时。
+
+
 # 使用
 
 ## 编译
@@ -81,6 +97,89 @@ make install
     15. 调用nanosleop睡眠
 11. 使用close()关闭"/dev/backfire"
 12. 执行return返回
+
+
+
+# 实现分析
+
+## 流程图
+
+![sendme](./resource/img/sendme.png)
+
+## 代码
+
+__主线程__
+
+从 main 函数入口，分析其主要运行逻辑
+int main(int argc, char **argv)
+```C
+{
+	//  声明变量
+	int path;
+	struct flock fl;
+
+	//  处理 进程 配置选项
+	process_options(argc, argv, max_cpus);
+	
+	...
+	// 打开 混杂设备
+	path = open("/dev/backfire", O_RDWR);
+
+	...
+	// 配置 文件 锁
+	fl.l_type = F_WRLCK;
+	fl.l_whence = SEEK_SET;
+	fl.l_start = 0;
+	fl.l_len = 1;
+
+	// 操作上锁
+	if (fcntl(path, F_SETLK, &fl) == -1) {
+		fprintf(stderr, "ERRROR: backfire device locked\n");
+		retval = 1;
+	} else {
+		// 上锁 成功 ，别人 无法 使用 此文件
+
+		while (1) {
+			struct timespec ts;
+
+			// 获取 当前 时间 
+			gettimeofday(&before, NULL);
+			// 写 文件 ，会调用 混杂设备 定义 的 write
+			write(path, sigtest, strlen(sigtest));
+			// 等
+			while (after.tv_sec == 0);
+			// 读 文件 ，会调用 混杂设备 定义 的 read
+			read(path, timestamp, sizeof(timestamp));
+			if (sscanf(timestamp, "%lu,%lu\n", &sendtime.tv_sec,
+			    &sendtime.tv_usec) != 2)
+				break;
+			diffno++;
+			if(max_cycles && diffno >= max_cycles)
+				shutdown = 1;
+
+			printf("Samples: %8d\n", diffno);
+			// 作差 计算 用户 空间 到 驱动  的 延时
+			timersub(&sendtime, &before, &diff);
+			// ...更新 统计 信息
+
+			// 作差 计算 驱动 到 用户空间 的 延时
+			timersub(&after, &sendtime, &diff);
+			// ...更新 统计 信息
+
+			// 重置
+			after.tv_sec = 0;
+			...
+		}
+	}
+	close(path);
+	return; 
+
+}
+```
+在main 函数 ，先打开 混杂 设备，然后对其上锁。
+再通过 自定义的  混杂设备的 驱动， 执行 write read 来 探测 用户到驱动，和 驱动到用户 的 延时。
+
+
 # 补充
 
 ## misc device 混杂设备
