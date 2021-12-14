@@ -122,47 +122,123 @@ Max 目前最大延时
 ![cyclictest](./_pic/cyclictest.jpg)
 # 实现方法
 ## 定义
-定义两个互斥量  
-测试锁  
-```
-static pthread_mutex_t *testmutex;
-```
-同步锁
-```
-static pthread_mutex_t *syncmutex;
-```
 线程参数 结构体
 ```
-struct params {
-	int num;
+struct thread_param {
+	int prio;
+	int policy;
+	int mode;
+	int timermode;
+	int signal;
+	int clock;
+	unsigned long max_cycles;
+	struct thread_stat *stats;
+	int bufmsk;
+	unsigned long interval;
 	int cpu;
-	int priority;
-	int affinity;
-	int sender;
-	int samples;
-	int max_cycles;
-	int tracelimit;
+	int node;
+	int tnum;
+};
+```
+
+线程统计 结构体
+```
+struct thread_stat {
+	unsigned long cycles;
+	unsigned long cyclesread;
+	long min;
+	long max;
+	long act;
+	double avg;
+	long *values;
+	long *hist_array;
+	long *outliers;
+	pthread_t thread;
+	int threadstarted;
 	int tid;
-	int shutdown;
-	int stopped;
-	struct timespec delay;
-	unsigned int mindiff, maxdiff;
-	double sumdiff;
-	struct timeval unblocked, received, diff;
-	pthread_t threadid;
-	struct params *neighbor;
-	char error[MAX_PATH * 2];
+	long reduce;
+	long redmax;
+	long cycleofmax;
+	long hist_overflow;
+	long num_outliers;
 };
 ```
 ## 方法
-互斥量线程
+计时器线程
 ```
-void *semathread(void *param)
+void *timerthread(void *param)
 ```
-根据 传入的param 判断是 sender 还是  receiver 执行对应收发逻辑
+通过 clock_gettime 和 clock_nanosleep 来 计算内核切换和调度所造成的延时多少
 ## syscall
 
-clock
+### clock_gettime
+```C
+#include<time.h>
+int clock_gettime(clockid_t clockid , struct timespec *tp);
+int clock_gettrs(clockid_t clockid, struct timespec *res);
+```
+返回的时间值置于 tp 指针所指向的 timespec 结构中。虽然 timespec 结构提供了纳秒级精度，但 clock_gettime()返回的时间值粒度可能还是要更大一点。系统调用 clock_getres()在参数 res中返回指向 timespec 结构的指针，结构中包含了由 clockid 所指定时钟的分辨率。clockid_t 是一种由 SUSv3 定义的数据类型，用于表示时钟标识符。
+
+clock id 类型
+1. CLOCK_REALTIME 可设定的系统级实时时钟
+2. CLOCK_MONOTONIC 不可设定的恒定态时钟
+3. CLOCK_PROCESS_CPUTIME_ID 每进程 CPU 时间的时钟
+4. CLOCK_THREAD_CPUTIME_ID 每线程 CPU 时间的时钟
+
+CLOCK_REALTIME 时钟是一种系统级时钟，用于度量真实时间。与 CLOCK_MONOTONIC 时钟不同，它的设置是可以变更的。
+
+SUSv3 规定，CLOCK_MONOTONIC 时钟对时间的度量始于“未予规范的过去某一时点”，系统启动后就不会发生改变。该时钟适用于那些无法容忍系统时钟发生跳跃性变化（例如：手工改变了系统时间）的应用程序。Linux 上，这种时钟对时间的测量始于系统启动。
+
+CLOCK_PROCESS_CPUTIME_ID 时钟测量调用进程所消耗的用户和系统 CPU 时间。CLOCK_THREAD_CPUTIME_ID 时钟的功用与之相类似，不过测量对象是进程中的单条线程。
+
+SUSv3 规范了表 23-1 中的所有时钟，但强制要求实现的仅有 CLOCK_REALTIME 一种，
+这同时也是受到 UNIX 实现广泛支持的时钟类型。
+
+
+### nanosleep
+
+函数 nanosleep()的功用与 sleep()类似，但更具优势，其中包括能以更高分辨率来设定休眠
+间隔时间
+```C
+#include<time.h>
+int nanosleep(const struct timespec *request, struct timespec *remain);
+```
+参数 request 指定了休眠的持续时间，是一个指向如下结构的指针
+```C
+struct timespec {
+	time_t tv_sec;  // 秒
+	long   tv_nsec; // 纳秒
+}
+```
+tv_nsec 字段为纳秒值，取值范围在 0～999999999 之间。
+
+nanosleep()的更大优势在于，SUSv3 明文规定不得使用信号来实现该函数。这意味着，与sleep()不同，即使将 nanosleep()与 alarm()或 setitimer()混用，也不会危及程序的可移植性
+
+### clock_nanosleep
+```C
+#include<time.h>
+int clock_nanosleep(clockid_t clockid . int flags, const struct timespec *request, struct timespec * remain);
+```
+参数 request 及 remain 同 nanosleep()中的对应参数目的相似。
+默认情况下（即 flags 为 0），由 request 指定的休眠间隔时间是相对时间（类似于 nanosleep()）。
+
+不过，如果在 flags 中设定了 TIMER_ABSTIME，request 则表示 clockid 时钟所测量的绝对时间。这一特性对于那些需要精确休眠一段指定时间的应用程序至关重要。
+
+如果只是先获取当前时间，计算与目标时间的差距，再以相对时间进行休眠，进程可能执行到一半就被占先了 ，结果休眠时间比预期的要久。
+
+对于那些被信号处理器函数中断并使用循环重启休眠的进程来说，
+“嗜睡（oversleeping）”问题尤其明显。如果以高频率接收信号，那么按相对时间休眠（nanosleep()
+所执行的类型）的进程在休眠时间上会有较大误差。但可以通过如下方式来避免嗜睡问题：
+
+先调用 clock_gettime()获取时间，加上期望休眠的时间量，再以 TIMER_ABSTIME 标志调用
+clock_nanosleep()函数（并且，如果被信号处理器中断，则会重启系统调用）。
+
+指定 TIMER_ABSTIME 时，不再（且不需要）使用参数 remain。如果信号处理器程序中断
+了 clock_nanosleep()调用，再次调用该函数来重启休眠时，request 参数不变。
+
+将 clock_nanosleep()与 nanosleep()区分开来的另一特性在于，可以选择不同的时钟来测量休
+眠间隔时间。可在 clockid 中指定所期望的时钟 CLOCK_REALTIME、CLOCK_ MONOTONIC
+或 CLOCK_PROCESS_CPUTIME_ID
 
 # 实现分析
 
