@@ -117,24 +117,25 @@ static pthread_mutex_t *syncmutex;
 线程参数 结构体
 ```C
 struct params {
-	int num;
-	int cpu;
-	int priority;
-	int affinity;
-	int sender;
-	int samples;
-	int max_cycles;
-	int tracelimit;
-	int tid;
-	int shutdown;
-	int stopped;
-	struct timespec delay;
-	unsigned int mindiff, maxdiff;
-	double sumdiff;
-	struct timeval unblocked, received, diff;
-	pthread_t threadid;
-	struct params *neighbor;
-	char error[MAX_PATH * 2];
+        int num;		// for循环的编号，一对儿发送者和接收者共具有相同的编号
+        int cpu;		// 线程使用了哪个cpu
+        int priority;	// 全局变量priority的值，非SMP测试这个值是递减的
+        int affinity;	// *没有使用的字段*
+        int sender;		// 0, receiver; 1, sender
+        int samples;	// 测量循环的次数
+        int max_cycles;	// 全局变量max_cycles的值
+        int tracelimit;	// 全局变量tracelimit的值
+        int tid;		// 线程id，内核视角
+        int shutdown;	// 线程应该结束的标志
+        int stopped;	// 线程已经结束的标志
+        struct timespec delay;			// 全局变量interval的值。这个值是递增的。
+        unsigned int mindiff, maxdiff;	// par->diff的最小值，最大值。
+        double sumdiff;					// par->diff的累加和。
+        struct timeval unblocked, received, diff;
+    								// r->diff = r->received - s->unblocked
+        pthread_t threadid;			// 线程id，POSIX视角
+        struct params *neighbor;	// 邻居线程的参数的指针
+        char error[MAX_PATH * 2];	// 当打开debugfs出错时，会把出错的路径记录于此
 };
 ```
 ## 方法
@@ -209,6 +210,13 @@ int main(int argc, char **argv)
 }
 ```
 声明 和 分配 空间 ， 主要 用到 的  receiver ， sender 是 保存对应线程状态和参数的数组，长度 由 设定 的 线程 数目 决定，testmutex，syncmutex是 这个测试 用来 测试 的互斥量，通过他们的 上锁 解锁，来计算延迟，从而 统计对比，内核性能。
+
+1. 执行`process_options()`设置好和用户选项相关的全局变量。
+2. `check_privs()`，调度策略方面的检查。
+3. `mlockall()`，内存方面的管理。
+4. `signal()`，让`signal()`处理特定信号使程序可以优雅地退出。
+5. `calloc()`，为子线程的参数数组分配内存，为子线程的互斥区分配内存。
+
 ```C
 ...
 // 循环开启新线程
@@ -253,6 +261,20 @@ for (i = 0; i < num_threads; i++) {
 	}
 ```
 在主线程内 负责 打印刚才 开启的线程的recevice 和  sender 统计信息。
+
+1. 判断是否已经有子线程设置了par->shutdown，如有则将shutdown置位，这表示整个程序都该退出了。
+
+2. 因为0号接收者是最先开始工作的，如果0号接收者上有了数据就表示可以打印数据了。
+
+   1. 首先打印的是接收者和发送者的信息。
+
+      `#[接收者编号] : ID[tid], P[优先级], CPU[运行在哪个核上], I[测量间隔us]; #[发送者编号] : P[优先级], CPU[运行在哪个核上], Cycles [测量次数]`
+
+   2. 然后打印统计信息。
+
+      `#[发送者编号] -> #[接收者编号], Min [最小时延], Cur[当前时延], Avg[平均时延], Max[最大时延]`
+
+3. 屏蔽SIGTERM和SIGINT，让主线程睡maindelay的时间，再取消对SIGTERM和SIGINT的屏蔽。目的是让主线程睡好。
 
 __计时器线程__  
 根据 sender 和 receiver ，执行 计时 ， 解锁， 计时 ，然后在上锁等待下次 同步
@@ -312,7 +334,22 @@ void *semathread(void *param)
 }
 ```
 
-
+1. 首先设置子线程的优先级和调度策略(FIFO)。
+2. 如用户使用了-a或-smp选项，则par->cpu != -1，此时需设置亲和性。
+3. 发送者子线程的工作循环
+   1. 发送者首先要锁定同步互斥锁，目的是不要让自己循环的太快，让接收者有时间处理数据。
+   2. 用`gettimeofday()`把时间记录在`par->unblocked`。
+   3. 释放测试互斥锁，让接收者可以锁定测试互斥锁。(第一轮循环的时候，测试互斥锁是主线程给锁上的；在随后的循环里，测试互斥锁是接收者子线程给锁上的)
+   4. 用par->samples记录测试循环发生了多少轮。
+4. 接收者子线程的工作循环
+   1. if分支永远都不可能发生，因为first的值始终都是1。
+   2. 锁定测试互斥锁。
+   3. 用`gettimeofday()`把时间记录在`par->received`。
+   4. 用`par->diff`记录下解锁到加锁这段时间，即`receiver->receive - sender->unblocked`。
+   5. 分别记录下`par->diff`的最小值，最大值，累加和。
+   6. 此if分支关于追踪指令，忽略。
+   7. 睡眠`par->delay`的时间，给其它子线程一些机会去运行。
+   8. 解锁同步互斥锁，让发送者子线程可以继续下一轮循环。
 
 # 引用
 
