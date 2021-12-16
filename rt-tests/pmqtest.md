@@ -104,32 +104,33 @@ Max
 # 实现方法
 ## 定义
 线程参数 结构体
-```
+```c
 struct params {
-	int num;
-	int cpu;
-	int priority;
-	int affinity;
-	int sender;
-	int samples;
-	int max_cycles;
-	int tracelimit;
-	int tid;
-	int shutdown;
-	int stopped;
-	struct timespec delay;
-	unsigned int mindiff, maxdiff;
-	double sumdiff;
-	struct timeval sent, received, diff;
-	pthread_t threadid;
-	int timeout;
-	int forcetimeout;
-	int timeoutcount;
-	mqd_t syncmq, testmq;
-	char recvsyncmsg[MSG_SIZE];
-	char recvtestmsg[MSG_SIZE];
-	struct params *neighbor;
-	char error[MAX_PATH * 2];
+        int num;		// 本线程在创建它的for循环里的编号
+        int cpu;		// 亲和性所对应的CPU。-1，不设置亲和性。
+        int priority;	// 优先级。如没有设置sameprio则递减。
+        int affinity;	// *此字段未使用*
+        int sender;		// 0，receiver；1，sender。
+        int samples;	// 采样次数，即子线程执行测试循环的次数
+        int max_cycles;	// 子线程最大测试次数
+        int tracelimit;	// 即全局变量tracelimit的值
+        int tid;		// 当前子线程的id。(内核视角)
+        int shutdown;	// 子线程应该关闭的标志。子线程据此标志退出测试循环。
+        int stopped;	// 子线程已经结束的标志。1,代表已结束。
+        struct timespec delay;	// 仅对接收者子线程有效。接收者子线程每次的测试循环里都会睡delay里记录的时间。这个值对应interval的值，interval是递增的。
+        unsigned int mindiff, maxdiff;	// 此参数仅记录在接收者，是r->diff的最小值和最大值
+        double sumdiff;	// 此参数仅记录在接收者，是r->diff的累加和
+        struct timeval sent, received, diff;
+    			// r->diff = r->received - s->sent
+        pthread_t threadid;		// 当前子线程的id。(POSIX视角)
+        int timeout;			// 即全局变量timeout的值。
+        int forcetimeout;		// 即全局变量forcetimeout的值。
+        int timeoutcount;		// 仅对接收者线程有效。如果设置了par->timeout，则意味着用mq_timedreceive()接收消息队列上的消息。timeoutcount则用来记录此函数超时的次数。
+        mqd_t syncmq, testmq;	// 消息队列的文件描述符，通过mq_open()得到
+        char recvsyncmsg[MSG_SIZE];	// 保存了发送者接收到的同步消息队列上的信息，接收者不用此字段
+        char recvtestmsg[MSG_SIZE];	// 保存了接收者接收到的测试消息队列上的信息，发送者不用此字段
+        struct params *neighbor;	// 同一for循环里创建的另一个子线程的参数
+        char error[MAX_PATH * 2];	// 如果打开debugfs里的tracing_enabled文件失败，则把它的路径信息记在这里
 };
 ```
 ## 方法
@@ -196,6 +197,15 @@ int main(int argc, char **argv)
 }
 ```
 声明 和 分配 空间 ， 主要 用到 的  receiver ， sender 是 保存对应线程状态和参数的数组，长度 由 设定 的 线程 数目 决定，mqstat 是用来设置消息队列的属性，通过消息队列的收发 ，来计算延迟，从而 统计对比，内核性能。
+
+1. mqstat是`mq_open()`的参数，描述的是要创建的消息队列的信息。即消息队列里最大可以有1条消息，每条消息最大可以是8字节。
+2. 调用`process_options()`处理选项，可参考[关键变量](#关键变量)。
+3. 调用`check_privs()`查询主进程是否处于实时调度，或可切换到实时调度。
+4. 调用`mlockall()`锁定当前及以后的内存。
+5. 用`pthread_sigmask()`屏蔽掉SIGTERM和SIGINT，让线程不处理这两个信号。这是为了后面用`signal()`设置这两个信号的处理例程。主线程会在合适的时机解除屏蔽。
+6. 调用`signal()`设置SIGTERM和SIGINT的处理例程为`sighand()`。`sighand()`仅是让全局变量`shutdown`置1，从而使整个程序可以优雅地退出。
+7. 为所有子线程的参数`struct params`分配内存空间。receiver是接收者线程的参数组成的数组，sender是接收者线程的参数组成的数组。
+
 ```C
 ...
 // 循环开启新线程
@@ -229,6 +239,7 @@ for (i = 0; i < num_threads; i++) {
 ```
 接下来进入 根据 设置的线程个数 开启新线程对，对 receiver和sender 设置好参数
 开启新线程，并指定 pmqthread 函数 作为 入口点
+
 ```C
 // 统计线程 
 	while (!shutdown) {
@@ -312,8 +323,24 @@ void *pmqthread(void *param)
 }
 ```
 
+1. 子线程的调度策略为SCHED_FIFO，通过`sched_setscheduler()`设置子线程的调度策略。
+2. `par->cpu != -1`代表用户使用了-a选项或-smp选项，此时走if分支调用`sched_setaffinity()`来设置亲和性；否则，将mustgetcpu设置为1，意思是仅记录当前线程用的哪个cpu（`par->cpu = get_cpu()`）。
+3. 调用`gettid()`获取当前线程的tid。
+4. 什么时候par->shutdown==1呢？发送者子线程发送测试信息失败，发送或接收信息的次数达到了用户规定的次数，发送者或接收者接收同步消息失败，发送者或接收者接收到的同步消息错误，`par->maxdiff > par->tracelimit`即记录到的时延超过了用户的限定，接收者子线程发送同步信息失败，当主线程发现已经有某个线程的`par->shutdown==1`的时候。当不满足以上条件的时候，就一直进行while循环进行测试。
+   1. 如果par->sender==1，说明是发送者线程，则走if分支。
+      1. 发送者会向测试消息队列上发消息，
+      2. 等同步消息队列上的信息，等接收完后就重新开始测试循环。
+   2. 如果par->sender==0，说明是接收者线程，则走else分支。
+      1. 接收者会等测试消息队列上的消息
+      2. 接收完后则记录下从发送到接收的时延
+      3. 记录下时延的最小值、最大值、累加和
+      4. 如果设置了tracelimit，则意味着开启了程序的追踪调试。如果最大时延超过tracelimit，则意味着最大时延发生了异常，应结束程序分析调试信息了。
+      5. 调用`clock_nanosleep()`睡`par->delay`的时间。
+      6. 向同步消息队列发信息，告诉等在同步消息队列里的发送者可以进行下一轮测试循环了。
+5. 走到此处，说明par->shutdown==1，退出了while循环，子线程该退出了。将par->stopped设置为1直接退出。
 
 # 引用
+
 <div id="refer-anchor-1"></div>  
 
 - [1] [pmqtest wiki](https://manpages.debian.org/stretch/rt-tests/pmqtest.8.en.html)
