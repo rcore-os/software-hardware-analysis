@@ -1,8 +1,7 @@
-# ptsematest 文档
 #  概述
 实时任务迁移程序。测试任务在多处理器上的实时调度，以确保最高优先级的任务可以运行在所有CPU上。
 ## 思路
-准备一些配置参数，在主线程中初始化好线程需要的变量，根据线程数量启动线程数量个线程对,通过pthread_mutex_lock(),pthread_mutex_unlock()方式同步线程,并在前后使用gettimeofday测量释放和获取锁之间的延迟。主线程负责统计性能。
+准备一些配置参数，在主线程中初始化好线程需要的变量，根据线程数量启动线程数量个线程,通过pthread_barrier_wait()让它们对齐,并在前后使用gettimeofday测量屏障前后的延迟。主线程负责统计性能。
 ## 原理
 
 实时线程A，B，C。线程C优先级最高，线程B次之，线程A优先级最低。
@@ -132,6 +131,16 @@ int main(int argc, char **argv)
 ```
 main 函数 一开始 初始化 一些 参数 ，其中 start_barrier，end_barrier，指明了 要 等待 的 任务数目
 
+1. `parse_options()`解析用户选项。
+2. 调用`signal()`让`stop_log()`处理SIGINT，是为了在用户输入Ctrl+C后，程序可以有序地退出。
+3. `threads`是子线程的id组成的数组，给它分配内存并初始化。
+4. 初始化屏障`start_barrier`和`end_barrier`。
+5. `itervals`用于记录每次迭代里每个线程在start_barrier屏障前后的时间差。
+6. `intervals_length`用于记录每次迭代里每个线程从start_barrier屏障开始前到record_time()运行时经历的时间。
+7. `intervals_loops`用于记录每次迭代里每个线程busy_loop的循环次数。
+8. `thread_pids`各子线程的id组成的数组。
+9. 在一个for循环里初始化itervals，intervals_length，intervals_loops数组的第二维。
+
 ```c
 ...
 // 循环开启新线程
@@ -180,6 +189,18 @@ for (i = 0; i < nr_tasks; i++) {
 ```
 在主线程内 负责 barrier 的 开关 控制 ，刚才 启动的 线程 什么时候 运行，什么 时候 停止，来以此 记录运行 时间。
 
+1. 睡眠intv的时间。给子线程一些机会运行，让它们都可以等在start_barrier上。
+2. 用now记录时间。
+3. 执行`ftrace_write()`把循环次数loop和now记录在trace_marker文件。
+4. 等待所有子线程都到达start_barrier。
+5. 向trace_marker文件写入字符串。
+6. 睡眠intv的时间。
+7. `print_progress_bar()`打印进度条。
+8. 用end记录时间。
+9. 把`loop`, `end`, `end-now`记录在trace_marker文件。
+10. 等待所有子进程都到达end_barrier。
+11. 用户输入Ctrl+C会让`stop`置1，用户如使用了-c选项则执行`check_times()`。出现以上情况表明该退出程序了，则用nr_runs记录实际循环的次数并退出for循环。
+
 
 ```c
 	...
@@ -222,6 +243,23 @@ void *start_task(void *param)
 }
 ```
 
+1. 通过`calc_prio()`计算优先级。子线程的优先级只有3种：`prio_start`, `prio_start+1`; `prio_start+nr_tasks-1`。
+2. 用save_cpumask记录当前线程的亲和性。
+3. 用数组`thread_pids`记录子线程的tid。
+4. 如果线程的编号是nr_tasks-1，则将high置位，意思是当前线程是所有子线程里优先级最高的子线程。
+5. 使用`sched_setscheduler()`设置当前线程的调度策略为SCHED_FIFO，优先级为通过`calc_prio()`计算出的优先级。
+6. 在一个while循环里进行测量循环：
+   1. 如果high==1，意味着当前线程是子线程里优先级最高的那个线程，则切换它的亲和性，以确保最高优先级的这个子线程可以运行在所有CPU上：
+      1. 当前的cpu在不在save_cpumask里，不在则将cpu置0。
+      2. 把cpu加到cpumask里并执行cpu++。
+      3. 依据cpumask设置当前线程的亲和性。
+   2. 让当前子线程等在屏障start_barrier。
+   3. 用start_time记录屏障start_barrier结束的时间。
+   4. 将`pid, start_time, start_time - now`记录在文件`trace_marker`里。
+   5. 执行`busy_loop`循环20us。
+   6. 执行`record_time`把要测量的时间记录在全局数组变量`intervals`, `intervals_length`里。
+   7. 让当前子线程等在屏障end_barrier
+7. 线程结束。
 
 # 引用
 
