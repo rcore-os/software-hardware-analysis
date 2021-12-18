@@ -1,4 +1,3 @@
-# ptsematest 文档
 #  概述
 信号往返延时测试
 ## 思路
@@ -97,39 +96,38 @@ Max
 
 ## 定义
 线程参数 
-```
+```c
 struct thread_param {
-    int id;
-    int prio;
-    int signal;
-    unsigned long max_cycles;
-    struct thread_stat *stats;
-    int bufmsk;
+        int id;		// for循环的编号
+        int prio;	// priority的值
+        int signal;	// signum，即SIGUSR1
+        unsigned long max_cycles;	// max_cycles的值
+        struct thread_stat *stats;
+        int bufmsk;	// stats->value的掩码
 };
 ```
 线程状态 统计
-```
+```c
 struct thread_stat {
-    unsigned long cycles;
-    unsigned long cyclesread;
-    long min;
-    long max;
-    long act;
-    double avg;
-    long *values;
-    pthread_t thread;
-    pthread_t tothread;
-    int threadstarted;
-    int tid;
+        unsigned long cycles;		// 测量循环的次数
+        unsigned long cyclesread;	// 在输出子线程统计信息的时候记录读到第几次循环的数据了。
+        long min;		// 等信号时延的最小值
+        long max;		// 等信号时延的最大值
+        long act;		// 等信号时延的实际值
+        double avg;		// 等信号时延的平均值
+        long *values;	// 记录了最近16384个时延的值
+        pthread_t thread;	// 线程id，POSIX视角
+        pthread_t tothread;	// 子线程排成一个圆圈传信号。0号传1号，1号传2号，... ，最后一个传0号。tothread就是指要传给的那个线程。
+        int threadstarted;	// 1,开始子线程；2,开始循环测量；-1,线程结束。
+        int tid;			// 线程id，内核视角
 };
-
 ```
 ## 方法
-互斥量线程
+信号子线程
 ```
 void *signalthread(void *param) 
 ```
-根据 传入的param 判断是 sender 还是  receiver 执行对应收发逻辑
+等待上一个子线程的信号，给下一个子线程发信号。
 ## syscall
 
 等待信号
@@ -282,6 +280,29 @@ void *signalthread(void *param)
 }
 ```
 
+1. 用户设置了-p则调度策略为SCHED_FIFO，否则为SCHED_OTHER。
+2. 用户设置了-b则写debugfs里的文件。
+3. 把SIGUSR1加到进程的信号屏蔽字。
+4. 依据用户-p的设置调整子线程的调度策略和优先级。
+5. stat->threadstarted++意思是子线程要开启测量循环了。
+6. 如用户设置了-b则走if分支，不知道它在说什么，暂忽略。
+7. 进入测量循环前，记录时间`before`。
+8. while循环作为测量循环：
+   1. 等SIGUSR1信号。
+   2. 记录时间`sigwait()`结束的时间`after`。
+   3. 编号为0的子线程每测量15次睡10ms。
+   4. 用`now`再记录一次时间。
+   5. 给下个线程传SIGUSR1信号。
+   6. 如果是第一次循环，则不进行测量，只记录时间`before`。
+   7. 能到此处，则不是第一次循环，记录等信号的时间`diff`。
+   8. 记录下次等信号之前的时间`before`。
+   9. 记录时延的最小、最大、累加和。
+   10. 如使用了-b选项且当前时延大于设定值，则stopped++置位意思是debugfs下次不再进行记录，shutdown++意思是程序该退出了。
+   11. 记录时延当前值，测量循环的次数。
+   12. 把当前时延的值记录到数组`stat->values`。
+   13. 如测量次数达到用户指定的次数，则退出测量循环。
+9. out标志，意味着测量完成，子线程准备退出了。
 
 # 引用
+
 [1]. [Signaltest源码分析](https://blog.csdn.net/sakaue/article/details/18090121)
