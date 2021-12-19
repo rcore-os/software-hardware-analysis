@@ -95,28 +95,31 @@ Max
 # 实现方法
 ## 定义
 线程参数  
-```
+```c
 struct params {
-    int num;
-    int num_threads;
-    int cpu;
-    int priority;
-    int affinity;
-    int sender;
-    int samples;
-    int max_cycles;
-    int tracelimit;
-    int tid;
-    pid_t pid;
-    int shutdown;
-    int stopped;
-    struct timespec delay;
-    unsigned int mindiff, maxdiff;
-    double sumdiff;
-    struct timeval unblocked, received, diff;
-    pthread_t threadid;
-    struct params *neighbor;
-    char error[MAX_PATH * 2];
+        int num;	// 线程编号
+        int num_threads;	// 全局变量num_threads的值
+        int cpu;	// 线程运行的CPU
+        int priority;	// 全局变量priority的值，各子线程递减1
+        int affinity;	// *没有使用的字段*
+        int sender;		// 0,接收者；1，发送者。
+        int samples;	// 循环测量的次数
+        int max_cycles;	// 全局变量max_cycles的值
+        int tracelimit;	// 全局变量tracelimit的值
+        int tid;		// 线程号，内核视角
+        pid_t pid;		// 子进程的进程号
+        int shutdown;	// 子进程/子线程应该退出的标志
+        int stopped;	// 子进程/子线程已经退出的标志
+        struct timespec delay;
+    		// 全局变量interval的值，各子线程递增distance
+        unsigned int mindiff, maxdiff;
+    		// 仅receiver记录，r->diff的最小值、最大值
+        double sumdiff;	// 仅receiver记录，r->diff的累加
+        struct timeval unblocked, received, diff;
+    		// r->diff = r->received - s->unblocked
+        pthread_t threadid;		// 线程号，POSIX视角
+        struct params *neighbor;	// 邻居子线程/子进程
+        char error[MAX_PATH * 2];	// 如设置了-b，则记录未能访问的debugfs文件
 };
 ```
 ## 方法
@@ -183,6 +186,19 @@ int main(int argc, char **argv)
 }
 ```
 声明 和 分配 空间 ， 主要 用到 的  receiver ， sender 是 保存对应线程状态和参数的数组，长度 由 设定 的 线程 数目决定， sigwait pthread_kill 是这个测试 用来 测试 的主要方法，通过他们的 阻塞和发送信号，来计算延迟，从而 统计对比，内核性能。
+
+1. `process_options()`处理用户选项。
+2. `check_privs()`检查是否可以切换为实时调度。
+3. `mlockall()`锁定内存。
+4. `get_cpu_setup()`初始化`get_cpu()`。
+5. 如mustfork置位，表示要创建子进程且当前是主进程，则为发送者子进程和接收者子进程的参数创建共享内存。
+6. 如wasforked置位，表示要创建子进程且当前是子进程，则需计算出semathread()函数的参数的指针。
+7. 如收到SIGINT或SIGTERM，则执行`sighand()`。
+8. 进程的信号屏蔽字全部置0。
+9. 如mustfork和wasforked都没有置位，表示用户没有使用-f选项，此时要创建的是子线程。则为子线程的参数创建内存空间。
+10. `launchdelay`是给子线程或子进程一些时间，让它们启动。设置为10ms。
+11. `maindelay`是主线程在打印循环里等待的时间。
+
 ```C
 ...
 // 循环开启新线程
@@ -268,5 +284,31 @@ void *semathread(void *param)
 }
 ```
 
+1. 设置调度策略为SCHED_FIFO，优先级为par->priority。
+2. 如用户使用了-a选项则设置亲和性，否则在随后获取当前运行的CPU。
+3. 如不是子进程，则记录线程id。
+4. 在for循环里进行测量循环：
+   1. 如是发送者
+      1. 用neighbor指向邻居的参数
+      2. 如是第一轮循环，则在信号屏蔽字里设置SIGUSR1。
+      3. 记录时间，准备向邻居receiver发信号SIGUSR2。
+      4. 向邻居发SIGUSR2信号。
+      5. 记录循环次数。
+      6. 如达到用户设置的循环次数，则给par->shutdown置位。
+      7. 如用户没使用-a选项，则需记录一下当前用的哪个cpu。
+      8. 等SIGUSR1信号。
+   2. 如是接收者
+      1. 用neighbor指向邻居的参数
+      2. 如是第一轮循环，则在信号屏蔽字里设置SIGUSR2。
+      3. 等信号SIGUSR2。
+      4. 记录接收到信号的时间。
+      5. 记录循环次数。
+      6. 如达到用户设置的循环次数，则给par->shutdown置位。
+      7. 如用户没使用-a选项，则需记录一下当前用的哪个cpu。
+      8. 记录测量到的参数。
+      9. 如用户使用了-b参数，且超过了用户的限制，则向debugfs的tracing_enabled文件写入0，并准备退出。
+      10. 睡眠，让发送者邻居等一等。
+      11. 给发送者邻居发SIGUSR1，表示可进行下一轮循环测量了。
+5. par->stopped置1表示退出
 
 # 引用
