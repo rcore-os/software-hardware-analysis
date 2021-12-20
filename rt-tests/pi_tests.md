@@ -47,7 +47,7 @@ struct State {
 * medium()执行的过程：通过set_rt_prio()函数将当前进程(即pid2)提升为中优先级，在互斥区statep->mutex内将statep->medium_started置1，然后在for(;;)里无限循环。
 ## 流程图
 
-![pip_stress](./_pic/pip_stress.png)
+![pip_stress](./resource/img/pip_stress.png)
 
 # pi_stress
 

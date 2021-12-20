@@ -118,7 +118,7 @@ Max 目前最大延时
 不论系统运行在任何代码路径，当事件发生时，系统响应该事件的时间即为延时。
 延时在不同的上下文有不同的含义，而cyclictest所测得的延时是中断延时加调度延时，如下图。中断延时(interrupt latency)，即中断发生到进入中断处理程序ISR的延时。调度延时(scheduling latency)，即当任务被唤醒到任务真正获得CPU使用权中间的延时。
 借用图片展示如下[<sup>1</sup>](#refer-anchor-1)  
-![cyclictest](./_pic/cyclictest.jpg)
+![cyclictest](./resource/img/cyclictest.jpg)
 # 实现方法
 ## 定义
 线程参数 结构体

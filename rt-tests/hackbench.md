@@ -87,7 +87,7 @@ hackbench -s 512 -l 200 -g 15 -f 25 -P    # 创建15对进程，每个进程�
 
 ## 流程图
 
-![hackbench](./_pic/hackbench.png)
+![hackbench](./resource/img/hackbench.png)
 
 
 
